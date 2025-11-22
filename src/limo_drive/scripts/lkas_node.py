@@ -45,10 +45,13 @@ class LKAS:
         self.nothing_flag = False
         self.cmd_vel_msg = Twist()
 
+        self.frame_skip = 3     # 3프레임 마다 계산
+        self._frame_count = 0
+
         # warp 관련 기본값
         self.img_x = 0
         self.img_y = 0
-        self.offset_x = 80  # BEV에서 좌우 여유. 필요하면 조절
+        self.offset_x = 40  # BEV에서 좌우 여유. 필요하면 조절
 
         self.enabled = True   # 기본값: FSM 없이 단독 돌릴 때도 동작하도록
         rospy.Subscriber("/lkas_enable", Bool, self.enable_cb, queue_size=1)
@@ -88,7 +91,7 @@ class LKAS:
         self.img_x, self.img_y = img.shape[1], img.shape[0]
 
         # src는 원본 이미지 상에서의 포인트 (사다리꼴)
-        src_center_offset = [200, 315]
+        src_center_offset = [100, 158]
         src = np.array(
             [
                 [0, self.img_y - 1],
@@ -415,8 +418,8 @@ class LKAS:
     # 속도/조향 명령 생성
     # ---------------------------------------------------------------------
     def ctrl_cmd(self, vehicle_offset):
-        self.cmd_vel_msg.linear.x = self.speed
-        self.cmd_vel_msg.angular.z = -vehicle_offset * self.trun_mutip
+        self.cmd_vel_msg.linear.x = 0.16
+        self.cmd_vel_msg.angular.z = -vehicle_offset * 0.14
         return self.cmd_vel_msg
 
     # ---------------------------------------------------------------------
@@ -427,8 +430,15 @@ class LKAS:
         if not self.enabled:
             return
         
+        self._frame_count += 1
+        if self._frame_count % self.frame_skip != 0:
+            return
         # 1) 이미지 변환
         img = self.bridge.compressed_imgmsg_to_cv2(data)
+
+        # === 해상도 1/2 DOWN ===
+        h, w = img.shape[:2]
+        img = cv2.resize(img, (w // 2, h // 2))
 
         # 2) 윈도우 파라미터
         self.nwindows = 10
