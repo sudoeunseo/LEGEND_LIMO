@@ -5,7 +5,7 @@ import math
 import rospy
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Float32, Bool
+from std_msgs.msg import Float32
 
 
 # ---------------- 공통 유틸 ----------------
@@ -21,62 +21,118 @@ def sanitize_range(r, range_max):
     return r
 
 
-def find_longest_free_gap_angle(msg, min_dist=1.0, fov_deg=120.0):
+def find_longest_free_gap_angle(msg,
+                                min_dist=1.0,
+                                fov_deg=120.0,
+                                min_gap_width_m=0.0,
+                                max_gap_width_m=999.0):
     """
     LaserScan에서 전방 fov_deg 범위 안에서
-    min_dist(m) 이상 떨어진 구간들 중
-    가장 길게 연속된 구간(gap)의 중심 각도(rad, ROS 기준: 왼쪽 +) 리턴
+    min_dist(m) 이상 떨어진 구간들 중 gap들을 찾는다.
 
-    여기서 min_dist = 1.0 → "100cm 앞까지 빈공간" 기준
+    - chosen_* : gap 폭이 [min_gap_width_m, max_gap_width_m] 안에 있는
+                 gap들 중에서 가장 넓은 것
+                 (없으면 chosen_center=0.0, chosen_width=0.0)
+    - longest_*: 폭 조건 상관 없이, 전방에서 가장 '길이(인덱스 개수)'가 긴 gap
+
+    리턴:
+      (chosen_center_angle, chosen_width_m,
+       longest_center_angle, longest_width_m)
+    각도 단위는 rad(ROS 기준: 왼쪽 +)
+    폭 단위는 m (대충 min_dist * 각도폭)
     """
     half = math.radians(fov_deg / 2.0)
     n = len(msg.ranges)
 
+    # 조건 만족 gap 중 가장 넓은 것
     best_start = None
     best_len = 0
+    best_width_m = 0.0
+
+    # 디버그용: 조건 무시하고 가장 긴 gap
+    fb_start = None
+    fb_len = 0
+    fb_width_m = 0.0
+
     cur_start = None
 
+    def process_gap(start_idx, end_idx_exclusive):
+        nonlocal best_start, best_len, best_width_m
+        nonlocal fb_start, fb_len, fb_width_m
+
+        length = end_idx_exclusive - start_idx
+        if length <= 0:
+            return
+
+        angle_start = msg.angle_min + start_idx * msg.angle_increment
+        angle_end   = msg.angle_min + (end_idx_exclusive - 1) * msg.angle_increment
+        angle_width = abs(angle_end - angle_start)  # rad
+
+        width_m = min_dist * angle_width
+
+        # --- longest gap (조건 무시) 기록 ---
+        if length > fb_len:
+            fb_len = length
+            fb_start = start_idx
+            fb_width_m = width_m
+
+        # --- 폭 조건 체크 ---
+        if width_m < min_gap_width_m or width_m > max_gap_width_m:
+            return
+
+        # 조건 만족 gap 중 가장 넓은 것
+        if width_m > best_width_m:
+            best_width_m = width_m
+            best_start = start_idx
+            best_len = length
+
+    # 메인 루프: safe 구간(gap) 찾기
     for i in range(n):
         angle = msg.angle_min + i * msg.angle_increment
 
         # FOV 밖이면 gap 끊기
         if angle < -half or angle > half:
             if cur_start is not None:
-                cur_len = i - cur_start
-                if cur_len > best_len:
-                    best_len = cur_len
-                    best_start = cur_start
+                process_gap(cur_start, i)
                 cur_start = None
             continue
 
         r = sanitize_range(msg.ranges[i], msg.range_max)
-        safe = r > min_dist  # 1m 이상이면 "멀리까지 빈공간"
+        safe = r > min_dist  # min_dist 이상이면 "멀리까지 빈공간"
 
         if safe:
             if cur_start is None:
                 cur_start = i
         else:
             if cur_start is not None:
-                cur_len = i - cur_start
-                if cur_len > best_len:
-                    best_len = cur_len
-                    best_start = cur_start
+                process_gap(cur_start, i)
                 cur_start = None
 
     # 마지막까지 이어진 gap 처리
     if cur_start is not None:
-        cur_len = n - cur_start
-        if cur_len > best_len:
-            best_len = cur_len
-            best_start = cur_start
+        process_gap(cur_start, n)
 
-    # 안전 구간 없음 → 정면 0
+    # gap 자체가 하나도 없는 경우
+    if fb_start is None or fb_len == 0:
+        return 0.0, 0.0, 0.0, 0.0
+
+    # longest gap 중심각
+    fb_center_idx = fb_start + fb_len // 2
+    fb_center_angle = msg.angle_min + fb_center_idx * msg.angle_increment
+
+    # 조건 만족 gap이 없으면 chosen은 0
     if best_start is None or best_len == 0:
-        return 0.0
+        chosen_center_angle = 0.0
+        chosen_width_m = 0.0
+    else:
+        chosen_center_idx = best_start + best_len // 2
+        chosen_center_angle = msg.angle_min + chosen_center_idx * msg.angle_increment
+        chosen_width_m = best_width_m
 
-    center_idx = best_start + best_len // 2
-    center_angle = msg.angle_min + center_idx * msg.angle_increment
-    return center_angle  # ROS 기준: 왼쪽 +, 오른쪽 -
+    longest_center_angle = fb_center_angle
+    longest_width_m = fb_width_m
+
+    return chosen_center_angle, chosen_width_m, longest_center_angle, longest_width_m
 
 
 # ---------------- 메인 클래스 ----------------
@@ -86,28 +142,30 @@ class GapAndEmergencyAvoidNode(object):
         rospy.init_node("obstacle_avoid")
 
         # ===== 파라미터 =====
-        # 토픽 이름들
         self.scan_topic    = rospy.get_param("~scan_topic", "/scan")
-        self.cmd_topic     = rospy.get_param("~cmd_topic", "/cmd_vel_obstacle")
-        self.enable_topic  = rospy.get_param("~enable_topic", "/obstacle_enable")
+        self.cmd_topic     = rospy.get_param("~cmd_topic", "/cmd_vel")
         self.debug_deg_topic = rospy.get_param("~debug_deg_topic", "/free_gap_angle_deg")
 
-        # 멀리 보는 gap 기준
-        self.free_dist      = rospy.get_param("~free_dist", 0.9)      # 100cm
-        self.fov_deg        = rospy.get_param("~fov_deg", 120.0)      # 전방 ±60도
+        # 멀리 gap 기준
+        self.free_dist      = rospy.get_param("~free_dist", 0.7)      # 100cm 근처
+        self.fov_deg        = rospy.get_param("~fov_deg", 150.0)      # 전방 ±60도
         self.linear_speed   = rospy.get_param("~linear_speed", 0.20)  # 평상시 전진 속도
         self.k_ang          = rospy.get_param("~k_ang", 1.0)          # gap 조향 gain
         self.max_yaw        = rospy.get_param("~max_yaw", 1.0)        # 최대 조향 속도
 
-        # 30cm 안 emergency 회피 기준
-        self.emergency_dist = rospy.get_param("~emergency_dist", 0.30)  # 30cm
-        self.min_dist_back  = rospy.get_param("~min_dist_back", 0.20)   # 이 이하면 뒤로
-        self.scan_degree    = rospy.get_param("~scan_degree", 55.0)     # ±scan_degree 내만 근접장애물 판단
+        # gap 폭 조건 (m 단위)
+        self.min_gap_width_m = rospy.get_param("~min_gap_width_m", 0.2)
+        self.max_gap_width_m = rospy.get_param("~max_gap_width_m", 0.6)  # 예: 0.5m 로 제한
+
+        # 근접 emergency 기준
+        self.emergency_dist = rospy.get_param("~emergency_dist", 0.30)  # 25~30cm
+        self.min_dist_back  = rospy.get_param("~min_dist_back", 0.15)   # 이 이하면 뒤로
+        self.scan_degree    = rospy.get_param("~scan_degree", 60.0)     # ±scan_degree 내만 근접장애물 판단
 
         self.default_speed   = self.linear_speed
         self.backward_speed  = rospy.get_param("~backward_speed", 0.15)
 
-        # LiDAR 관련 상태
+        # LiDAR 상태
         self.lidar_flag      = False
         self.degrees         = []
         self.ranges_length   = 0
@@ -115,30 +173,23 @@ class GapAndEmergencyAvoidNode(object):
         self.obstacle_ranges = []
         self.direction       = "front"  # front / right / left / right_back / left_back / back
 
-        # enable (FSM에서 /obstacle_enable 들어옴)
-        self.enabled         = True
+        # 마지막으로 선택된 gap 폭 (조향 여부 판별용)
+        self.last_chosen_width = 0.0
 
-        # 퍼블리셔
+        # 퍼블리셔 / 서브스크라이버
         self.cmd_pub         = rospy.Publisher(self.cmd_topic, Twist, queue_size=1)
         self.debug_deg_pub   = rospy.Publisher(self.debug_deg_topic, Float32, queue_size=1)
 
-        # 서브스크라이버
         rospy.Subscriber(self.scan_topic, LaserScan, self.scan_cb, queue_size=1)
-        rospy.Subscriber(self.enable_topic, Bool, self.enable_cb, queue_size=1)
 
         rospy.loginfo("GapAndEmergencyAvoidNode started.")
-        rospy.loginfo("  scan_topic=%s, cmd_topic=%s, enable_topic=%s",
-                      self.scan_topic, self.cmd_topic, self.enable_topic)
+        rospy.loginfo("  scan_topic=%s, cmd_topic=%s",
+                      self.scan_topic, self.cmd_topic)
+        rospy.loginfo("  free_dist=%.2f, fov=%.1fdeg, gap_width=[%.2f, %.2f] m",
+                      self.free_dist, self.fov_deg,
+                      self.min_gap_width_m, self.max_gap_width_m)
 
-    def enable_cb(self, msg: Bool):
-        """
-        FSM MUX 에서 오는 /obstacle_enable 신호
-        True  → 연산/회피 활성
-        False → 이 노드 계산 스킵 (CPU 아낌)
-        """
-        self.enabled = msg.data
-
-    # ---------- 네가 준 LiDAR_scan 로직 정리 버전 ----------
+    # ---------- LiDAR_scan: 30cm 안 근접 장애물 ----------
     def LiDAR_scan(self, l_msg):
         obstacle_idx = []
 
@@ -158,7 +209,6 @@ class GapAndEmergencyAvoidNode(object):
             if 0.0 < data < self.emergency_dist and \
                -self.scan_degree < self.degrees[i] < self.scan_degree:
                 obstacle_idx.append(i)
-                # 가장 가까운 장애물 거리 기록
                 if data < min_obstacle_dist:
                     min_obstacle_dist = data
 
@@ -182,7 +232,7 @@ class GapAndEmergencyAvoidNode(object):
     # ---------- 방향 결정 ----------
     def decide_direction(self, first_dst, last_dst, has_obstacle):
         if has_obstacle:
-            # first_dst > last_dst → 오른쪽으로 공간 많다 → 오른쪽으로 회피
+            # first_dst > last_dst → 오른쪽에 더 공간 → 오른쪽 회피
             if first_dst > last_dst and self.dist_data > self.min_dist_back:
                 self.direction = "right"
             elif first_dst < last_dst and self.dist_data > self.min_dist_back:
@@ -198,13 +248,19 @@ class GapAndEmergencyAvoidNode(object):
     # ---------- direction 에 따라 Twist 생성 ----------
     def make_cmd_from_direction(self, free_gap_angle_ros):
         """
-        free_gap_angle_ros : 멀리(1m) 기준으로 찾은 gap 각도(rad, 왼쪽+)
-        self.direction     : LiDAR_scan + decide_direction 에서 결정된 값
+        free_gap_angle_ros : 선택된 gap의 중심각(rad, 왼쪽+)
+        self.last_chosen_width : 그 gap 폭 (0이면 조건 만족 gap 없음)
         """
         cmd = Twist()
 
         if self.direction == "front":
-            # ☆ 정상 모드: 1m 기준 가장 긴 gap 방향으로 전진
+            # 조건 만족 gap 이 없으면 => 안전하게 정지
+            if self.last_chosen_width <= 0.0:
+                cmd.linear.x = 0.15
+                cmd.angular.z = 0.0
+                return cmd
+
+            # 정상 모드: 선택된 gap 방향으로 전진
             ang_z = self.k_ang * free_gap_angle_ros
             if ang_z > self.max_yaw:
                 ang_z = self.max_yaw
@@ -215,32 +271,26 @@ class GapAndEmergencyAvoidNode(object):
             cmd.angular.z = ang_z
 
         elif self.direction == "right":
-            # 오른쪽으로 회피 (ROS 기준 오른쪽은 -)
             cmd.linear.x = self.default_speed * 0.5
             cmd.angular.z = -self.max_yaw * 0.7
 
         elif self.direction == "left":
-            # 왼쪽으로 회피
             cmd.linear.x = self.default_speed * 0.5
             cmd.angular.z = self.max_yaw * 0.7
 
         elif self.direction == "right_back":
-            # 오른쪽으로 돌면서 후진
             cmd.linear.x = -self.backward_speed
             cmd.angular.z = -self.max_yaw * 0.7
 
         elif self.direction == "left_back":
-            # 왼쪽으로 돌면서 후진
             cmd.linear.x = -self.backward_speed
             cmd.angular.z = self.max_yaw * 0.7
 
         elif self.direction == "back":
-            # 그냥 직진 후진 (필요하면 사용)
             cmd.linear.x = -self.backward_speed
             cmd.angular.z = 0.0
 
         else:
-            # 안전빵: 멈춤
             cmd.linear.x = 0.0
             cmd.angular.z = 0.0
 
@@ -248,42 +298,53 @@ class GapAndEmergencyAvoidNode(object):
 
     # ---------- 메인 콜백 ----------
     def scan_cb(self, msg: LaserScan):
-        # FSM에서 obstacle_disable 이면 그냥 정지 명령만 보내고 계산 스킵해도 됨
-        if not self.enabled:
-            # 필요하면 여기서 아예 0 cmd를 계속 보내고 싶으면 주석 해제
-            # cmd = Twist()
-            # self.cmd_pub.publish(cmd)
-            return
-
-        # 1) 100cm 기준 가장 긴 빈공간 각도 찾기 (멀리용)
-        free_angle_ros = find_longest_free_gap_angle(
+        # 1) 100cm 기준 gap 정보
+        (free_angle_ros,
+         chosen_width_m,
+         longest_center_ros,
+         longest_width_m) = find_longest_free_gap_angle(
             msg,
-            min_dist=self.free_dist,   # 1.0m
-            fov_deg=self.fov_deg
+            min_dist=self.free_dist,
+            fov_deg=self.fov_deg,
+            min_gap_width_m=self.min_gap_width_m,
+            max_gap_width_m=self.max_gap_width_m
         )
 
-        # 2) 30cm 안 근접 장애물 스캔
+        self.last_chosen_width = chosen_width_m
+
+        # 2) 근접 장애물 스캔
         first, first_dst, last, last_dst, has_obstacle = self.LiDAR_scan(msg)
 
-        # 3) 근접 장애물이 있으면 direction 결정 / 없으면 front
+        # 3) direction 결정
         self.decide_direction(first_dst, last_dst, has_obstacle)
 
-        # 4) 디버그: 네가 원하는 기준(정면0, 오른쪽+, 왼쪽-) 각도 publish
-        deg_ros = free_angle_ros * 180.0 / math.pi    # ROS: 왼쪽+
-        deg_user = -deg_ros                           # USER: 오른쪽+
+        # 4) 디버그: 각도/폭
+        deg_ros_chosen   = free_angle_ros * 180.0 / math.pi
+        deg_ros_longest  = longest_center_ros * 180.0 / math.pi
+
+        rospy.loginfo(
+            "dir=%s | chosen_gap: center=%.1fdeg(ROS,left+), width=%.2fm | "
+            "longest_gap: center=%.1fdeg(ROS), width=%.2fm | dist_data=%.3f",
+            self.direction,
+            deg_ros_chosen, chosen_width_m,
+            deg_ros_longest, longest_width_m,
+            self.dist_data
+        )
+
+        # 디버그용 degree (사용자 기준: 오른쪽 +, 왼쪽 -)
+        deg_user = -deg_ros_chosen
         if deg_user > 60.0:
-            deg_user = 60.0
+            deg_user_clamped = 60.0
         elif deg_user < -60.0:
-            deg_user = -60.0
+            deg_user_clamped = -60.0
+        else:
+            deg_user_clamped = deg_user
 
         dbg = Float32()
-        dbg.data = deg_user
+        dbg.data = deg_user_clamped
         self.debug_deg_pub.publish(dbg)
 
-        rospy.loginfo("dir=%s, free_gap=ROS %.1fdeg (left+), USER %.1fdeg (right+), dist_data=%.3f",
-                      self.direction, deg_ros, deg_user, self.dist_data)
-
-        # 5) direction + free_gap_angle 로 최종 cmd_vel 생성
+        # 5) 최종 cmd_vel publish
         cmd = self.make_cmd_from_direction(free_angle_ros)
         self.cmd_pub.publish(cmd)
 
@@ -294,3 +355,4 @@ if __name__ == "__main__":
         rospy.spin()
     except rospy.ROSInterruptException:
         pass
+

@@ -4,7 +4,7 @@ import rospy
 from sensor_msgs.msg import CompressedImage
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
-
+from std_msgs.msg import Bool
 import numpy as np
 import cv2
 from math import atan
@@ -35,6 +35,8 @@ class LKAS:
 
         # cmd_vel publisher
         self.ctrl_pub = rospy.Publisher("/cmd_vel_lkas", Twist, queue_size=1)
+        self.speed = 0.16
+        self.trun_mutip = 0.12
 
         # 상태 변수들
         self.start_time = rospy.get_time()
@@ -45,6 +47,12 @@ class LKAS:
         self.img_x = 0
         self.img_y = 0
         self.offset_x = 80  # BEV에서 좌우 여유. 필요하면 조절
+
+        self.enabled = True   # 기본값: FSM 없이 단독 돌릴 때도 동작하도록
+        rospy.Subscriber("/lkas_enable", Bool, self.enable_cb, queue_size=1)
+
+    def enable_cb(self, msg: Bool):
+        self.enabled = msg.data
 
     # ---------------------------------------------------------------------
     # 색 기반 차선 검출
@@ -59,7 +67,7 @@ class LKAS:
 
         # 흰색 범위
         white_lower = np.array([0, 0, 200], dtype=np.uint8)
-        white_upper = np.array([179, 64, 255], dtype=np.uint8)
+        white_upper = np.array([179, 60, 255], dtype=np.uint8)  # 하얀색 범위 수정
 
         # 마스크 계산
         yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
@@ -70,6 +78,20 @@ class LKAS:
 
         # 원본 이미지에서 해당 색만 남기기
         return cv2.bitwise_and(img, img, mask=blend_mask)
+
+    # ---------------------------------------------------------------------
+    # 이진화 후 후처리 (작은 객체 제거)
+    # ---------------------------------------------------------------------
+    def remove_small_objects(self, binary_img, min_area=500):
+        # 연결된 컴포넌트 분석 (Connected Components)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_img)
+
+        # 너무 작은 객체들은 제거
+        for i in range(1, num_labels):  # 배경은 제외
+            if stats[i, cv2.CC_STAT_AREA] < min_area:
+                binary_img[labels == i] = 0
+
+        return binary_img
 
     # ---------------------------------------------------------------------
     # Bird-Eye-View warp
@@ -130,6 +152,9 @@ class LKAS:
         x0, x1 = max(0, cx - hw), min(w, cx + hw)
         y0, y1 = max(0, cy - up), min(h, cy + dn)
         binary_line[y0:y1, x0:x1] = 0
+
+        # 3) 작은 객체들 필터링 (후처리)
+        binary_line = self.remove_small_objects(binary_line)
 
         return binary_line
 
@@ -301,69 +326,6 @@ class LKAS:
         return out_img, left_pts, right_pts, center_pts, left_x, left_y, right_x, right_y
 
     # ---------------------------------------------------------------------
-    # 픽셀 → 미터 변환 비율
-    # ---------------------------------------------------------------------
-    def meter_per_pixel(self):
-        # 고정된 월드 좌표 (타입 명시)
-        world_warp = np.array(
-            [[97, 1610], [109, 1610], [109, 1606], [97, 1606]], dtype=np.float32
-        )
-
-        # x 방향(세로) 거리
-        dx_x = world_warp[0, 0] - world_warp[3, 0]
-        dy_x = world_warp[0, 1] - world_warp[3, 1]
-        meter_x = dx_x * dx_x + dy_x * dy_x
-
-        # y 방향(가로) 거리
-        dx_y = world_warp[0, 0] - world_warp[1, 0]
-        dy_y = world_warp[0, 1] - world_warp[1, 1]
-        meter_y = dx_y * dx_y + dy_y * dy_y
-
-        meter_per_pix_x = meter_x / float(self.img_x)
-        meter_per_pix_y = meter_y / float(self.img_y)
-
-        return meter_per_pix_x, meter_per_pix_y
-
-    # ---------------------------------------------------------------------
-    # 곡률 계산
-    # ---------------------------------------------------------------------
-    def calc_curve(self, left_x, left_y, right_x, right_y):
-        # 평가할 y (화면 맨 아래 쪽)
-        y_eval = self.img_x - 1  # 원 코드 유지
-
-        # 픽셀 → 미터 변환 계수
-        meter_per_pix_x, meter_per_pix_y = self.meter_per_pixel()
-
-        # 월드 좌표(미터 단위)로 스케일링
-        left_y_m = left_y * meter_per_pix_y
-        left_x_m = left_x * meter_per_pix_x
-        right_y_m = right_y * meter_per_pix_y
-        right_x_m = right_x * meter_per_pix_x
-
-        # 2차 다항식 피팅
-        left_fit_cr = np.polyfit(left_y_m, left_x_m, 2)
-        right_fit_cr = np.polyfit(right_y_m, right_x_m, 2)
-
-        # 공통으로 쓰는 y_eval·meter_per_pix_y 곱
-        y_eval_m = y_eval * meter_per_pix_y
-
-        # 곡률 계산
-        a_l, b_l = left_fit_cr[0], left_fit_cr[1]
-        a_r, b_r = right_fit_cr[0], right_fit_cr[1]
-
-        denom_l = 2.0 * a_l
-        denom_r = 2.0 * a_r
-
-        left_curve_radius = (
-            (1.0 + (2.0 * a_l * y_eval_m + b_l) ** 2) ** 1.5 / np.abs(denom_l)
-        )
-        right_curve_radius = (
-            (1.0 + (2.0 * a_r * y_eval_m + b_r) ** 2) ** 1.5 / np.abs(denom_r)
-        )
-
-        return left_curve_radius, right_curve_radius
-
-    # ---------------------------------------------------------------------
     # 차량 중심에서 차선 중앙까지 오프셋 계산
     # ---------------------------------------------------------------------
     def calc_vehicle_offset(self, sliding_window_img, left_x, left_y, right_x, right_y):
@@ -390,23 +352,11 @@ class LKAS:
         return vehicle_offset
 
     # ---------------------------------------------------------------------
-    # 카메라 기반 조향각 계산 (현재는 사용 안 함)
-    # ---------------------------------------------------------------------
-    def cam_cal_steer(self, left_curve_radius, right_curve_radius, vehicle_offset):
-        curvature = 2.0 / (left_curve_radius + right_curve_radius)
-        cam_steer = atan(curvature - 0.5 * curvature) * 100  # atan(0.5 * curvature)
-
-        if vehicle_offset > 0:
-            cam_steer = -cam_steer
-
-        return cam_steer
-
-    # ---------------------------------------------------------------------
     # 속도/조향 명령 생성
     # ---------------------------------------------------------------------
     def ctrl_cmd(self, vehicle_offset):
-        self.cmd_vel_msg.linear.x = 0.08
-        self.cmd_vel_msg.angular.z = -vehicle_offset * 0.14
+        self.cmd_vel_msg.linear.x = self.speed
+        self.cmd_vel_msg.angular.z = -vehicle_offset * self.trun_mutip
         return self.cmd_vel_msg
 
     # ---------------------------------------------------------------------
@@ -414,7 +364,9 @@ class LKAS:
     # ---------------------------------------------------------------------
     def img_CB(self, data):
         now = rospy.get_time()
-
+        if not self.enabled:
+            return
+        
         # 1) 이미지 변환
         img = self.bridge.compressed_imgmsg_to_cv2(data)
 
