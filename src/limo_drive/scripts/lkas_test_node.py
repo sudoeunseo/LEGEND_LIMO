@@ -123,30 +123,53 @@ class LKAS:
         _, binary255 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY)
 
         h, w = binary255.shape
+        binary_line = (binary255 > 0).astype(np.uint8)  # 0/1
 
-        # (선택) 아주 약한 close로 차선 끊김만 살짝 연결 (숫자 부활 방지 위해 작게)
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        binary255 = cv2.morphologyEx(binary255, cv2.MORPH_CLOSE, k)
+        # ------------------------------------------------------------
+        # (1) Dynamic between-lanes removal ONLY (robust)
+        # ------------------------------------------------------------
 
-        # Connected Components로 "세로로 길고(높이 큼), 가늘거나(AR 큼)" 한 것만 유지
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(binary255, connectivity=8)
+        # 1) 히스토그램은 "더 아래쪽"만 사용 (숫자/글자 영향 줄이기)
+        band_y0 = int(h * 0.65)                 # 하단 35%만
+        band = binary_line[band_y0:, :]
+        histogram = np.sum(band, axis=0).astype(np.float32)
 
-        out = np.zeros((h, w), dtype=np.uint8)
+        # 2) 히스토그램 스무딩(피크 안정화)
+        #    (1D를 2D로 reshape해서 가우시안 블러 적용)
+        histogram = cv2.GaussianBlur(histogram.reshape(1, -1), (1, 31), 0).ravel()
 
-        # 기준값(너무 공격적이면 차선도 날아가서 직진만 함)
-        min_h = int(h * 0.20)      # (KR) 성분 높이 최소 / (EN) min component height
-        min_area = int(h * w * 0.0003)
-        min_ar = 2.0              # aspect ratio = height/width
+        # 3) 피크 탐색 구간을 더 바깥으로 제한 (중앙 숫자 오염 방지)
+        l0 = int(w * 0.05)
+        l1 = int(w * 0.40)
+        r0 = int(w * 0.60)
+        r1 = int(w * 0.95)
 
-        for i in range(1, num):
-            x, y, ww, hh, area = stats[i]
-            if area < min_area:
-                continue
-            ar = (hh / float(ww + 1e-6))
-            if (hh >= min_h) and (ar >= min_ar):
-                out[labels == i] = 1  # 0/1로 유지
+        if (l1 <= l0) or (r1 <= r0):
+            return binary_line
 
-        return out
+        left_peak = int(np.argmax(histogram[l0:l1]) + l0)
+        right_peak = int(np.argmax(histogram[r0:r1]) + r0)
+
+        left_strength = float(histogram[left_peak])
+        right_strength = float(histogram[right_peak])
+
+        # 4) 강도 임계값: 고정값 대신 "상위 퍼센타일 기반"으로 프레임 적응
+        #    너무 빡세면 항상 아무 것도 안 해서 다시 숫자 오인/이탈이 생김
+        p90 = float(np.percentile(histogram, 90))
+        min_strength = max(10.0, p90 * 0.35)   # 상황 따라 0.25~0.45로 튜닝
+        min_gap = int(w * 0.22)                # 곡선에서 간격이 줄어도 통과되게 약간 완화
+
+        if (left_strength > min_strength) and (right_strength > min_strength) and ((right_peak - left_peak) > min_gap):
+            keep_margin = int(max(12, w * 0.04))  # 차선 보존 여유폭 (너무 크면 곡선에서 차선이 잘림)
+            x0 = min(w, left_peak + keep_margin)
+            x1 = max(0, right_peak - keep_margin)
+
+            if x0 < x1:
+                # 5) 마스크는 "상부/중부까지만" 적용 → 하단 차선 시작점 보존
+                y_end = int(h * 0.85)
+                binary_line[:y_end, x0:x1] = 0
+
+        return binary_line
 
 
 
