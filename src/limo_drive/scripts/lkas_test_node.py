@@ -119,82 +119,44 @@ class LKAS:
     # 이진화 + 중앙 영역 마스크
     # ---------------------------------------------------------------------
     def img_binary(self, blend_line):
-        # 1) 기본 이진화 (0/255로 만든 뒤 마지막에 0/1로 변환)
         gray = cv2.cvtColor(blend_line, cv2.COLOR_BGR2GRAY)
         _, binary255 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY)
 
         h, w = binary255.shape
+        binary_line = (binary255 > 0).astype(np.uint8)  # 0/1
 
-        # ------------------------------------------------------------------
-        # (3) Vertical continuity filter: 세로로 길게 이어진 구조(차선)만 살리고
-        #     가운데 숫자처럼 '덩어리/가로획' 성분은 억제
-        # ------------------------------------------------------------------
-        # 세로 커널 높이: 화면 높이에 비례 (너무 크면 곡선/끊김에 약해짐)
-        k_h = int(max(15, min(60, h * 0.08)))   # 15~60 사이
-        k_w = 3                                # 가로폭은 얇게
-        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_w, k_h))
-
-        # OPEN: 세로로 연속되지 않는 블랍(숫자)을 많이 제거
-        vertical = cv2.morphologyEx(binary255, cv2.MORPH_OPEN, v_kernel)
-
-        # CLOSE(약하게): 차선이 점선/끊김이면 약간 이어주기 (너무 세게 하면 숫자 부활 가능)
-        c_h = int(max(9, min(35, h * 0.05)))
-        c_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, c_h))
-        vertical = cv2.morphologyEx(vertical, cv2.MORPH_CLOSE, c_kernel)
-
-        # 0/1 형태로 변환 (기존 파이프라인(window_search)이 0/1 가정)
-        binary_line = (vertical > 0).astype(np.uint8)
-
-        # ------------------------------------------------------------------
-        # (1) Dynamic "between-lanes" removal: 히스토그램으로 좌/우 차선 x를 먼저 추정하고
-        #     두 차선 "사이" 영역만 동적으로 제거 (숫자 위치가 딱 그 사이)
-        # ------------------------------------------------------------------
+        # ---------------------------
+        # (1) Dynamic between-lanes removal ONLY
+        # ---------------------------
         bottom_half = binary_line[h // 2 :, :]
         histogram = np.sum(bottom_half, axis=0)
 
-        midpoint = w // 2
-        left_region = histogram[:midpoint]
-        right_region = histogram[midpoint:]
+        # 숫자(중앙) 영향 줄이려고 피크 탐색을 좌/우 구간으로 제한
+        left_search_end = int(w * 0.45)
+        right_search_start = int(w * 0.55)
 
-        # 유효한 피크가 있는지 체크 (없으면 fallback로 아래 고정 마스크 사용)
-        left_peak = int(np.argmax(left_region)) if left_region.size > 0 else 0
-        right_peak = int(np.argmax(right_region) + midpoint) if right_region.size > 0 else midpoint
+        left_region = histogram[:left_search_end]
+        right_region = histogram[right_search_start:]
 
-        left_strength = left_region[left_peak] if left_region.size > 0 else 0
-        right_strength = right_region[right_peak - midpoint] if right_region.size > 0 else 0
+        if left_region.size == 0 or right_region.size == 0:
+            return binary_line
 
-        # 피크 강도/간격이 의미 있을 때만 “사이 영역 제거” 적용
-        # - strength 기준은 상황 따라 조절 가능하지만, 일단 안전하게 낮게 둠
-        min_strength = max(30, int(0.02 * (h // 2)))  # 경험적: 너무 빡세게 잡지 않음
-        min_gap = int(w * 0.25)                       # 좌우 차선 간격이 최소 이 정도는 되어야 함
+        left_peak = int(np.argmax(left_region))
+        right_peak = int(np.argmax(right_region) + right_search_start)
+
+        left_strength = left_region[left_peak]
+        right_strength = histogram[right_peak]
+
+        # 너무 빡세면 항상 fallback으로 빠지니, 약하게만 게이트
+        min_strength = max(10, int(0.02 * (h // 2)))  # (KR) 기존 30보다 낮춤 / (EN) less strict
+        min_gap = int(w * 0.25)
 
         if (left_strength > min_strength) and (right_strength > min_strength) and ((right_peak - left_peak) > min_gap):
-            keep_margin = int(max(20, w * 0.05))  # 차선 자체를 보존하기 위한 여유폭
+            keep_margin = int(max(10, w * 0.03))  # 차선 보존 여유폭 (기존보다 약간 보수적으로)
             x0 = min(w, left_peak + keep_margin)
             x1 = max(0, right_peak - keep_margin)
-
             if x0 < x1:
-                # 차선 사이(가운데)만 제거 → 숫자 대부분 제거
-                binary_line[:, x0:x1] = 0
-        else:
-            # ------------------------------------------------------------------
-            # 기존의 "중앙 고정 사각형 제거"는 fallback으로만 유지
-            # (동적 추정이 실패한 프레임에서만 발동)
-            # ------------------------------------------------------------------
-            center_y_ratio = 0.55
-            up_ratio = 0.50
-            down_ratio = 0.50
-            half_width_ratio = 0.30
-
-            cx = w // 2
-            cy = int(h * center_y_ratio)
-            up = int(h * up_ratio)
-            dn = int(h * down_ratio)
-            hw = int(w * half_width_ratio)
-
-            x0, x1 = max(0, cx - hw), min(w, cx + hw)
-            y0, y1 = max(0, cy - up), min(h, cy + dn)
-            binary_line[y0:y1, x0:x1] = 0
+                binary_line[:, x0:x1] = 0  # 차선 사이만 제거(숫자 제거)
 
         return binary_line
 
