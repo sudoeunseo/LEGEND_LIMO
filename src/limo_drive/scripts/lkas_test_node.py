@@ -1,16 +1,19 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import os
 import rospy
+import numpy as np
+import cv2
+
 from sensor_msgs.msg import CompressedImage
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 from std_msgs.msg import Bool
 
-import numpy as np
-import cv2
-from math import atan
+
+def clamp(v, vmin, vmax):
+    return max(vmin, min(vmax, v))
 
 
 class LKAS:
@@ -18,32 +21,30 @@ class LKAS:
         rospy.init_node("lkas_node")
 
         # -----------------------------
-        # (FSM 호환) 토픽 파라미터
+        # (FSM_MUX 호환) 토픽 파라미터
         # -----------------------------
         self.image_topic  = rospy.get_param("~image_topic",  "/camera/rgb/image_raw/compressed")
-        self.cmd_topic    = rospy.get_param("~cmd_topic",    "/cmd_vel_lkas")     # FSM이 받는 토픽 :contentReference[oaicite:4]{index=4}
-        self.enable_topic = rospy.get_param("~enable_topic", "/lkas_enable")      # FSM이 publish :contentReference[oaicite:5]{index=5}
-
-        # FSM 붙여서 쓸 때: enable 신호가 들어올 때만 동작하도록
-        self.use_fsm = rospy.get_param("~use_fsm", True)
+        self.cmd_topic    = rospy.get_param("~cmd_topic",    "/cmd_vel_lkas")     # FSM_MUX가 구독 :contentReference[oaicite:3]{index=3}
+        self.enable_topic = rospy.get_param("~enable_topic", "/lkas_enable")      # FSM_MUX가 publish :contentReference[oaicite:4]{index=4}
+        self.use_fsm      = rospy.get_param("~use_fsm", True)
 
         # CvBridge
         self.bridge = CvBridge()
 
         # Publishers/Subscribers
         self.ctrl_pub = rospy.Publisher(self.cmd_topic, Twist, queue_size=1)
-
         rospy.Subscriber(self.image_topic, CompressedImage, self.img_CB, queue_size=1)
         rospy.Subscriber(self.enable_topic, Bool, self.enable_cb, queue_size=1)
 
         # -----------------------------
         # 주행 파라미터
         # -----------------------------
-        self.speed = rospy.get_param("~speed", 0.18)
-        self.trun_mutip = rospy.get_param("~turn_mult", 0.14)
+        self.speed       = float(rospy.get_param("~speed", 0.18))
+        self.steer_gain  = float(rospy.get_param("~steer_gain", 0.9))   # (권장) 픽셀 정규화 기반 gain
+        self.max_yawrate = float(rospy.get_param("~max_yawrate", 1.2))
 
         # 프레임 스킵
-        self.frame_skip = int(rospy.get_param("~frame_skip", 3))
+        self.frame_skip = int(rospy.get_param("~frame_skip", 2))
         self._frame_count = 0
 
         # warp 관련
@@ -51,26 +52,41 @@ class LKAS:
         self.img_y = 0
         self.offset_x = int(rospy.get_param("~offset_x", 40))
 
-        # 슬라이딩 윈도우
+        # sliding window
         self.nwindows = int(rospy.get_param("~nwindows", 10))
         self.window_height = 0
         self.nothing_flag = False
 
         # publish rate limit
         self.last_pub_time = rospy.get_time()
-        self.pub_period = float(rospy.get_param("~pub_period", 0.1))
+        self.pub_period = float(rospy.get_param("~pub_period", 0.05))  # 20Hz 기본
 
         # enable 상태
-        if self.use_fsm:
-            self.enabled = False  # FSM enable 들어오기 전에는 동작 X
-        else:
-            self.enabled = True   # 단독 실행 시 바로 동작
-
+        self.enabled = (not self.use_fsm)
         self.prev_enabled = self.enabled
         self.have_published_cmd = False
 
         # -----------------------------
-        # imshow 디버그(안전)
+        # 동적 "차선 사이" 제거 + 폭/추종 모드 파라미터
+        # -----------------------------
+        self.y_start_ratio     = float(rospy.get_param("~y_start_ratio", 0.45))
+        self.hist_roi_ratio    = float(rospy.get_param("~hist_roi_ratio", 0.60))   # 아래쪽 몇 %로 히스토그램
+        self.left_search_ratio = float(rospy.get_param("~left_search_ratio", 0.45))
+        self.right_search_ratio= float(rospy.get_param("~right_search_ratio", 0.55))
+
+        self.keep_edge_px      = int(rospy.get_param("~keep_edge_px", 12))         # 차선 라인 보존 여유
+        self.min_peak_value    = int(rospy.get_param("~min_peak_value", 30))       # 히스토그램 peak 최소
+        self.min_lane_width_px = int(rospy.get_param("~min_lane_width_px", 80))    # 너무 좁으면 무시
+
+        self.widen_factor      = float(rospy.get_param("~widen_factor", 1.55))     # 폭이 EMA 대비 이 이상이면 "한쪽만"
+        self.width_ema_alpha   = float(rospy.get_param("~width_ema_alpha", 0.15))  # lane width EMA 업데이트율
+
+        self.lane_width_ema = None
+        self.prev_left_base = None
+        self.prev_right_base = None
+
+        # -----------------------------
+        # imshow 디버그
         # -----------------------------
         self.debug_view  = bool(rospy.get_param("~debug_view", False))
         self.debug_wait  = int(rospy.get_param("~debug_wait", 1))
@@ -83,22 +99,26 @@ class LKAS:
         rospy.loginfo("[LKAS] image_topic=%s, cmd_topic=%s, enable_topic=%s, use_fsm=%s",
                       self.image_topic, self.cmd_topic, self.enable_topic, str(self.use_fsm))
 
-    def enable_cb(self, msg):
+    # -------------------------------------------------------
+    # FSM enable callback
+    # -------------------------------------------------------
+    def enable_cb(self, msg: Bool):
         self.enabled = bool(msg.data)
 
-        # enable이 True -> False로 바뀌는 순간: 한 번 정지 명령 publish (잔류 cmd 방지)
+        # True -> False 전환 시 stop 1회 publish (잔류 cmd 방지)
         if (self.prev_enabled is True) and (self.enabled is False) and self.have_published_cmd:
             stop = Twist()
             stop.linear.x = 0.0
             stop.angular.z = 0.0
             self.ctrl_pub.publish(stop)
+
         self.prev_enabled = self.enabled
 
-    # -----------------------------
+    # -------------------------------------------------------
     # 색 기반 차선 검출
-    # -----------------------------
-    def detect_color(self, img):
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    # -------------------------------------------------------
+    def detect_color(self, img_bgr):
+        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
 
         yellow_lower = np.array([15, 80, 0], dtype=np.uint8)
         yellow_upper = np.array([45, 255, 255], dtype=np.uint8)
@@ -110,14 +130,15 @@ class LKAS:
         white_mask  = cv2.inRange(hsv, white_lower,  white_upper)
 
         blend_mask = yellow_mask | white_mask
-        return cv2.bitwise_and(img, img, mask=blend_mask)
+        return cv2.bitwise_and(img_bgr, img_bgr, mask=blend_mask)
 
-    # -----------------------------
+    # -------------------------------------------------------
     # BEV warp
-    # -----------------------------
+    # -------------------------------------------------------
     def img_warp(self, img):
         self.img_x, self.img_y = img.shape[1], img.shape[0]
 
+        # NOTE: 이 src는 카메라 세팅에 민감함(필요시 파라미터화 권장)
         src_center_offset = [100, 158]
         src = np.array(
             [
@@ -142,54 +163,85 @@ class LKAS:
         matrix = cv2.getPerspectiveTransform(src, dst)
         return cv2.warpPerspective(img, matrix, (self.img_x, self.img_y))
 
-    # -----------------------------
-    # 이진화 + 숫자 억제(중앙 밴드)
-    # -----------------------------
-    def img_binary(self, blend_line):
-        gray = cv2.cvtColor(blend_line, cv2.COLOR_BGR2GRAY)
-        _, binary_line = cv2.threshold(gray, 0, 1, cv2.THRESH_BINARY)
+    # -------------------------------------------------------
+    # (1) 이진화
+    # (2) 하단 히스토그램으로 좌/우 차선 base 추정
+    # (3) "차선 사이"만 동적으로 제거
+    # -------------------------------------------------------
+    def img_binary_dynamic(self, blend_line_bgr):
+        gray = cv2.cvtColor(blend_line_bgr, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 0, 1, cv2.THRESH_BINARY)
 
-        h, w = binary_line.shape
-        cx = w // 2
+        h, w = binary.shape
+        y_hist = int(h * self.hist_roi_ratio)
+        y_start = int(h * self.y_start_ratio)
 
-        center_band_half = int(w * 0.23)     # 0.18~0.28 조절
-        y_start = int(h * 0.45)              # 0.35~0.60 조절
+        # 히스토그램(하단 ROI)
+        hist = np.sum(binary[y_hist:h, :], axis=0)
 
-        x0 = max(0, cx - center_band_half)
-        x1 = min(w, cx + center_band_half)
-        binary_line[y_start:h, x0:x1] = 0
+        left_end = int(w * self.left_search_ratio)
+        right_start = int(w * self.right_search_ratio)
 
-        return binary_line
+        left_hist = hist[:left_end]
+        right_hist = hist[right_start:]
 
-    # -----------------------------
+        left_base = None
+        right_base = None
+
+        if left_hist.size > 0:
+            li = int(np.argmax(left_hist))
+            if left_hist[li] >= self.min_peak_value:
+                left_base = li
+
+        if right_hist.size > 0:
+            ri = int(np.argmax(right_hist))
+            if right_hist[ri] >= self.min_peak_value:
+                right_base = right_start + ri
+
+        # 이전 값 fallback
+        if left_base is None:
+            left_base = self.prev_left_base
+        if right_base is None:
+            right_base = self.prev_right_base
+
+        # 저장
+        self.prev_left_base = left_base
+        self.prev_right_base = right_base
+
+        # 차선 사이(내부) 제거: 두 base가 있고 폭이 충분하면 내부만 제거
+        if (left_base is not None) and (right_base is not None):
+            width = right_base - left_base
+            if width >= self.min_lane_width_px:
+                x0 = int(left_base + self.keep_edge_px)
+                x1 = int(right_base - self.keep_edge_px)
+                x0 = clamp(x0, 0, w)
+                x1 = clamp(x1, 0, w)
+                if x1 > x0:
+                    binary[y_start:h, x0:x1] = 0
+
+        return binary, left_base, right_base
+
+    # -------------------------------------------------------
     # nothing fallback
-    # -----------------------------
+    # -------------------------------------------------------
     def detect_nothing(self):
         offset = int(self.img_x * 0.140625)
         self.nothing_left_x_base = offset
         self.nothing_right_x_base = self.img_x - offset
 
-        self.nothing_pixel_left_x = np.full(self.nwindows, self.nothing_left_x_base, dtype=np.int32)
-        self.nothing_pixel_right_x = np.full(self.nwindows, self.nothing_right_x_base, dtype=np.int32)
-
-        base_y = int(self.window_height / 2)
-        self.nothing_pixel_y = np.arange(0, self.nwindows * base_y, base_y, dtype=np.int32)
-
-    # -----------------------------
-    # sliding window
-    # -----------------------------
-    def window_search(self, binary_line):
+    # -------------------------------------------------------
+    # sliding window (base 입력 가능)
+    # -------------------------------------------------------
+    def window_search(self, binary_line, left_base=None, right_base=None):
         h, w = binary_line.shape
 
-        bottom_half = binary_line[h // 2 :, :]
-        histogram = np.sum(bottom_half, axis=0)
+        if left_base is None:
+            left_base = self.nothing_left_x_base
+        if right_base is None:
+            right_base = self.nothing_right_x_base
 
-        midpoint = w // 2
-        left_x_base = np.argmax(histogram[:midpoint])
-        right_x_base = np.argmax(histogram[midpoint:]) + midpoint
-
-        left_x_current = left_x_base if left_x_base != 0 else self.nothing_left_x_base
-        right_x_current = right_x_base if right_x_base != midpoint else self.nothing_right_x_base
+        left_x_current = int(left_base)
+        right_x_current = int(right_base)
 
         out_img = (np.dstack((binary_line, binary_line, binary_line)).astype(np.uint8) * 255)
 
@@ -228,92 +280,121 @@ class LKAS:
         left_lane_idx = np.concatenate(left_lane_idx_list) if left_lane_idx_list else np.array([], dtype=int)
         right_lane_idx = np.concatenate(right_lane_idx_list) if right_lane_idx_list else np.array([], dtype=int)
 
-        left_x = lane_x[left_lane_idx]
-        left_y = lane_y[left_lane_idx]
-        right_x = lane_x[right_lane_idx]
-        right_y = lane_y[right_lane_idx]
+        left_x = lane_x[left_lane_idx] if left_lane_idx.size else np.array([], dtype=np.int32)
+        left_y = lane_y[left_lane_idx] if left_lane_idx.size else np.array([], dtype=np.int32)
+        right_x = lane_x[right_lane_idx] if right_lane_idx.size else np.array([], dtype=np.int32)
+        right_y = lane_y[right_lane_idx] if right_lane_idx.size else np.array([], dtype=np.int32)
 
-        if len(left_x) == 0 and len(right_x) == 0:
-            left_x = self.nothing_pixel_left_x
-            left_y = self.nothing_pixel_y
-            right_x = self.nothing_pixel_right_x
-            right_y = self.nothing_pixel_y
-        else:
-            if len(left_x) == 0:
-                left_x = right_x - self.img_x // 2
-                left_y = right_y
-            elif len(right_x) == 0:
-                right_x = left_x + self.img_x // 2
-                right_y = left_y
+        left_cnt = int(left_x.size)
+        right_cnt = int(right_x.size)
 
-        left_fit = np.polyfit(left_y, left_x, 2)
-        right_fit = np.polyfit(right_y, right_x, 2)
+        # 둘 다 없으면 실패
+        if left_cnt == 0 and right_cnt == 0:
+            return out_img, None
 
-        plot_y = np.linspace(0, h - 1, 5)
-        left_fit_x = left_fit[0] * plot_y**2 + left_fit[1] * plot_y + left_fit[2]
-        right_fit_x = right_fit[0] * plot_y**2 + right_fit[1] * plot_y + right_fit[2]
-        center_fit_x = (right_fit_x + left_fit_x) / 2.0
+        # 2차 곡선 fit (있는 쪽만)
+        left_fit = None
+        right_fit = None
 
-        left_pts = np.int32(np.column_stack((left_fit_x, plot_y)))
-        right_pts = np.int32(np.column_stack((right_fit_x, plot_y)))
-        center_pts = np.int32(np.column_stack((center_fit_x, plot_y)))
+        if left_cnt > 30:
+            left_fit = np.polyfit(left_y, left_x, 2)
+        if right_cnt > 30:
+            right_fit = np.polyfit(right_y, right_x, 2)
 
-        cv2.polylines(out_img, [left_pts], False, (0, 0, 255), 5)
-        cv2.polylines(out_img, [right_pts], False, (0, 255, 0), 5)
-        cv2.polylines(out_img, [center_pts], False, (255, 0, 0), 3)
+        return out_img, {
+            "left_fit": left_fit,
+            "right_fit": right_fit,
+            "left_cnt": left_cnt,
+            "right_cnt": right_cnt,
+            "h": h,
+            "w": w,
+        }
 
-        return out_img, left_x, left_y, right_x, right_y
+    # -------------------------------------------------------
+    # 목표 lane center 계산: (폭 급증 시 한쪽 차선 추종)
+    # -------------------------------------------------------
+    def compute_lane_center(self, fit_info):
+        h = fit_info["h"]
+        w = fit_info["w"]
+        yb = h - 1
 
-    # -----------------------------
-    # offset 계산
-    # -----------------------------
-    def meter_per_pixel(self):
-        world_warp = np.array([[97, 1610], [109, 1610], [109, 1606], [97, 1606]], dtype=np.float32)
+        left_fit = fit_info["left_fit"]
+        right_fit = fit_info["right_fit"]
+        left_cnt = fit_info["left_cnt"]
+        right_cnt = fit_info["right_cnt"]
 
-        dx_x = world_warp[0, 0] - world_warp[3, 0]
-        dy_x = world_warp[0, 1] - world_warp[3, 1]
-        meter_x = dx_x * dx_x + dy_x * dy_x
+        # bottom x 계산
+        bottom_x_left = None
+        bottom_x_right = None
 
-        dx_y = world_warp[0, 0] - world_warp[1, 0]
-        dy_y = world_warp[0, 1] - world_warp[1, 1]
-        meter_y = dx_y * dx_y + dy_y * dy_y
+        if left_fit is not None:
+            a, b, c = left_fit
+            bottom_x_left = a * (yb**2) + b * yb + c
 
-        meter_per_pix_x = meter_x / float(self.img_x)
-        meter_per_pix_y = meter_y / float(self.img_y)
-        return meter_per_pix_x, meter_per_pix_y
+        if right_fit is not None:
+            a, b, c = right_fit
+            bottom_x_right = a * (yb**2) + b * yb + c
 
-    def calc_vehicle_offset(self, img, left_x, left_y, right_x, right_y):
-        left_fit = np.polyfit(left_y, left_x, 2)
-        right_fit = np.polyfit(right_y, right_x, 2)
+        # lane width EMA 업데이트(둘 다 있을 때만)
+        width = None
+        if (bottom_x_left is not None) and (bottom_x_right is not None):
+            width = float(bottom_x_right - bottom_x_left)
+            if width > self.min_lane_width_px and width < w * 0.95:
+                if self.lane_width_ema is None:
+                    self.lane_width_ema = width
+                else:
+                    a = self.width_ema_alpha
+                    self.lane_width_ema = (1 - a) * self.lane_width_ema + a * width
 
-        h = img.shape[0]
-        bottom_y = h - 1
-        y2 = bottom_y * bottom_y
+        # EMA가 아직 없으면 보수적으로 w*0.5 사용
+        nominal_width = float(self.lane_width_ema) if self.lane_width_ema is not None else float(w * 0.5)
 
-        a_l, b_l, c_l = left_fit
-        a_r, b_r, c_r = right_fit
+        # 기본: 둘 다 있으면 가운데
+        if (bottom_x_left is not None) and (bottom_x_right is not None):
+            # 폭이 갑자기 커지면 -> 한쪽 차선 추종 모드
+            if (self.lane_width_ema is not None) and (width is not None) and (width > self.widen_factor * self.lane_width_ema):
+                # 픽셀 수 많은 쪽을 우선
+                if left_cnt >= right_cnt:
+                    lane_center_x = bottom_x_left + 0.5 * nominal_width
+                else:
+                    lane_center_x = bottom_x_right - 0.5 * nominal_width
+            else:
+                lane_center_x = 0.5 * (bottom_x_left + bottom_x_right)
 
-        bottom_x_left = a_l * y2 + b_l * bottom_y + c_l
-        bottom_x_right = a_r * y2 + b_r * bottom_y + c_r
+            return float(clamp(lane_center_x, 0.0, float(w - 1)))
 
-        img_center_x = img.shape[1] / 2.0
-        lane_center_x = (bottom_x_left + bottom_x_right) / 2.0
-        pixel_offset = img_center_x - lane_center_x
+        # 한쪽만 있는 경우: 그쪽 기준으로 중심 합성
+        if bottom_x_left is not None:
+            lane_center_x = bottom_x_left + 0.5 * nominal_width
+            return float(clamp(lane_center_x, 0.0, float(w - 1)))
 
-        meter_per_pix_x, _ = self.meter_per_pixel()
-        vehicle_offset = pixel_offset * (2 * meter_per_pix_x)
-        return vehicle_offset
+        if bottom_x_right is not None:
+            lane_center_x = bottom_x_right - 0.5 * nominal_width
+            return float(clamp(lane_center_x, 0.0, float(w - 1)))
 
-    def ctrl_cmd(self, vehicle_offset):
+        return None
+
+    # -------------------------------------------------------
+    # 제어: 픽셀 오차 정규화 기반 (단순/안정)
+    # -------------------------------------------------------
+    def ctrl_cmd_from_center(self, lane_center_x, img_w):
+        img_center_x = img_w / 2.0
+        err_px = lane_center_x - img_center_x
+
+        # [-1, 1] 정규화
+        err_norm = err_px / (img_w / 2.0)
+
         msg = Twist()
-        msg.linear.x = self.speed
-        msg.angular.z = -vehicle_offset * self.trun_mutip
+        msg.linear.x = float(self.speed)
+
+        yaw = -self.steer_gain * err_norm
+        msg.angular.z = float(clamp(yaw, -self.max_yawrate, self.max_yawrate))
         return msg
 
-    # -----------------------------
+    # -------------------------------------------------------
     # image callback
-    # -----------------------------
-    def img_CB(self, data):
+    # -------------------------------------------------------
+    def img_CB(self, data: CompressedImage):
         if not self.enabled:
             return
 
@@ -322,44 +403,54 @@ class LKAS:
             return
 
         try:
-            img = self.bridge.compressed_imgmsg_to_cv2(data)
+            img = self.bridge.compressed_imgmsg_to_cv2(data, desired_encoding="bgr8")
 
-            # downscale
-            h, w = img.shape[:2]
-            img = cv2.resize(img, (w // 2, h // 2))
+            # downscale (연산량 감소)
+            h0, w0 = img.shape[:2]
+            img = cv2.resize(img, (w0 // 2, h0 // 2))
 
             # window params
             self.window_height = img.shape[0] // self.nwindows
 
             warp_img = self.img_warp(img)
             blend_img = self.detect_color(warp_img)
-            binary_img = self.img_binary(blend_img)
+
+            # (핵심) 동적 "차선 사이" 제거
+            binary_img, left_base, right_base = self.img_binary_dynamic(blend_img)
 
             if not self.nothing_flag:
                 self.detect_nothing()
                 self.nothing_flag = True
 
-            sliding_window_img, left_x, left_y, right_x, right_y = self.window_search(binary_img)
+            sliding_window_img, fit_info = self.window_search(binary_img, left_base, right_base)
 
-            vehicle_offset = self.calc_vehicle_offset(sliding_window_img, left_x, left_y, right_x, right_y)
-            ctrl_cmd_msg = self.ctrl_cmd(vehicle_offset)
+            # 차선 중심 계산 실패 시: 안전하게 정지
+            if fit_info is None:
+                cmd = Twist()
+            else:
+                lane_center_x = self.compute_lane_center(fit_info)
+                if lane_center_x is None:
+                    cmd = Twist()
+                else:
+                    cmd = self.ctrl_cmd_from_center(lane_center_x, fit_info["w"])
 
-            # imshow (optional)
+            # debug view
             if self.debug_view and (self._frame_count % self.debug_every == 0):
                 binary_vis = (binary_img * 255).astype(np.uint8)
                 cv2.imshow("01_raw_resized", img)
                 cv2.imshow("02_warp", warp_img)
                 cv2.imshow("03_color_blend", blend_img)
-                cv2.imshow("04_binary", binary_vis)
+                cv2.imshow("04_binary_dynamic", binary_vis)
                 cv2.imshow("05_sliding_window", sliding_window_img)
                 key = cv2.waitKey(self.debug_wait) & 0xFF
                 if key == ord("q") or key == 27:
                     rospy.signal_shutdown("User requested shutdown via OpenCV window")
                     return
 
+            # rate limit publish
             now = rospy.get_time()
             if now - self.last_pub_time >= self.pub_period:
-                self.ctrl_pub.publish(ctrl_cmd_msg)
+                self.ctrl_pub.publish(cmd)
                 self.have_published_cmd = True
                 self.last_pub_time = now
 
