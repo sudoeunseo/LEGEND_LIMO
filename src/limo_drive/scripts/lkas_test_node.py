@@ -139,8 +139,11 @@ class LKAS:
         # (핵심) 중앙 영역 제거 마스크
         # 숫자/문자/로고가 차선 사이 중앙에 있으므로 중앙 밴드를 지움
         # -----------------------------
-        center_band_half = int(w * 0.23)     # 중앙 밴드 반폭(조절 포인트) 0.18~0.28 추천
+        center_band_half = int(w * 0.23)     # 중앙 밴드 반폭(조절 포인트) 0.18~0.28 추천 
         y_start = int(h * 0.45)              # 이 아래 구간에서만 중앙 밴드 제거(조절 포인트) 0.35~0.60 추천
+
+        # center_band_half: 숫자가 아직 남으면 키우기 (0.23 → 0.26)
+        # y_start: 숫자가 제거되는데 차선까지 같이 잘리면 내리기 (0.45 → 0.55
 
         x0 = max(0, cx - center_band_half)
         x1 = min(w, cx + center_band_half)
@@ -358,7 +361,7 @@ class LKAS:
 
         # 월드 좌표(미터 단위)로 스케일링
         left_y_m = left_y * meter_per_pix_y
-        left_x_m = left_x * meter_per_pix_xk
+        left_x_m = left_x * meter_per_pix_x
         right_y_m = right_y * meter_per_pix_y
         right_x_m = right_x * meter_per_pix_x
 
