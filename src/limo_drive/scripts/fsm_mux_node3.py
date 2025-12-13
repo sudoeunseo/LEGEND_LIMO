@@ -78,7 +78,7 @@ class FSMMuxNode:
         # mission3 DWA 강제 구간
         self.m3_force_obs_duration  = rospy.get_param("~m3_force_obs_duration", 5.0)
         # ★ mission3 끝난 직후 base obstacle 강제 구간
-        self.m3_force_base_duration = rospy.get_param("~m3_force_base_duration", 4.0)
+        self.m3_force_base_duration = rospy.get_param("~m3_force_base_duration", 1.0)
 
         # v2x
         self.v2x_phase_time      = rospy.get_param("~v2x_phase_time", 19.0)
