@@ -70,11 +70,11 @@ class FSMMuxNode:
 
         # ----- Mission3 / V2X 타이밍 파라미터 -----
         self.m3_phase_time       = rospy.get_param("~m3_phase_time", 35.3)   # 첫 LKAS cmd 이후 기준
-        self.m3_turn_duration    = rospy.get_param("~m3_turn_duration", 3.0)
+        self.m3_turn_duration    = rospy.get_param("~m3_turn_duration", 2.5)
         self.m3_turn_speed       = rospy.get_param("~m3_turn_speed", 0.16)
         self.m3_turn_yaw         = rospy.get_param("~m3_turn_yaw", -0.4)
 
-        self.m3_force_obs_duration = rospy.get_param("~m3_force_obs_duration", 9.0)
+        self.m3_force_obs_duration = rospy.get_param("~m3_force_obs_duration", 15.0)
 
         self.v2x_phase_time      = rospy.get_param("~v2x_phase_time", 22.0)
         self.v2x_turn_duration   = rospy.get_param("~v2x_turn_duration", 0.5)
