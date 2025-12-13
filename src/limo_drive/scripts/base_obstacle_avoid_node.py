@@ -36,7 +36,7 @@ class Limo_obstacle_avoidence:
         self.center_list_left = []
         self.center_list_right = []
 
-        self.scan_dgree = 60
+        self.scan_dgree = 50
         self.min_dist = 0.2
 
         self.speed = 0
