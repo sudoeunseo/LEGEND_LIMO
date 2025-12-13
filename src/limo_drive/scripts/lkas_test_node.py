@@ -3,13 +3,13 @@
 
 import os
 import rospy
+import numpy as np
+import cv2
+
 from sensor_msgs.msg import CompressedImage
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 from std_msgs.msg import Bool
-
-import numpy as np
-import cv2
 
 
 def clamp(v, vmin, vmax):
@@ -30,6 +30,7 @@ class LKAS(object):
 
         self.bridge = CvBridge()
 
+        # Publishers/Subscribers
         self.ctrl_pub = rospy.Publisher(self.cmd_topic, Twist, queue_size=1)
         rospy.Subscriber(self.image_topic, CompressedImage, self.img_CB, queue_size=1)
         rospy.Subscriber(self.enable_topic, Bool, self.enable_cb, queue_size=1)
@@ -39,7 +40,7 @@ class LKAS(object):
         # -----------------------------
         self.speed      = float(rospy.get_param("~speed", 0.18))
         self.turn_mult  = float(rospy.get_param("~turn_mult", 0.14))
-        self.max_yaw    = float(rospy.get_param("~max_yaw", 0.8))   # 과도한 조향 제한
+        self.max_yaw    = float(rospy.get_param("~max_yaw", 0.8))   # 조향 과도 방지
 
         # 프레임 스킵
         self.frame_skip = int(rospy.get_param("~frame_skip", 3))
@@ -67,7 +68,9 @@ class LKAS(object):
             self.enabled = True
         self.prev_enabled = self.enabled
 
-        # imshow 디버그(안전)
+        # -----------------------------
+        # 디버그(선택)
+        # -----------------------------
         self.debug_view  = bool(rospy.get_param("~debug_view", False))
         self.debug_wait  = int(rospy.get_param("~debug_wait", 1))
         self.debug_every = int(rospy.get_param("~debug_every", 1))
@@ -75,25 +78,29 @@ class LKAS(object):
             rospy.logwarn("[LKAS] DISPLAY not set. Disable imshow to avoid crash.")
             self.debug_view = False
 
+        self.debug_throttle = float(rospy.get_param("~debug_throttle", 1.0))  # log throttle sec
+
         # -----------------------------
         # (핵심) “차선 사이 동적 제거 + 폭 벌어지면 한쪽만 추종” 파라미터
         # -----------------------------
         self.roi_y_start_ratio = float(rospy.get_param("~roi_y_start_ratio", 0.45))  # 하단 ROI 시작
-        self.roi_y_end_ratio   = float(rospy.get_param("~roi_y_end_ratio",   1.00))  # 하단 ROI 끝(보통 h)
-        self.between_margin_px = int(rospy.get_param("~between_margin_px", 12))      # 차선 안쪽으로 여유
+        self.roi_y_end_ratio   = float(rospy.get_param("~roi_y_end_ratio",   1.00))  # 하단 ROI 끝
+        self.between_margin_px = int(rospy.get_param("~between_margin_px", 12))      # 차선 안쪽 여유
 
-        self.hist_left_max_ratio  = float(rospy.get_param("~hist_left_max_ratio", 0.45))  # 좌 탐색 끝
-        self.hist_right_min_ratio = float(rospy.get_param("~hist_right_min_ratio", 0.55)) # 우 탐색 시작
-        self.min_lane_sep_ratio   = float(rospy.get_param("~min_lane_sep_ratio", 0.20))   # 최소 좌우 간격
+        self.hist_left_max_ratio  = float(rospy.get_param("~hist_left_max_ratio", 0.45))
+        self.hist_right_min_ratio = float(rospy.get_param("~hist_right_min_ratio", 0.55))
+        self.min_lane_sep_ratio   = float(rospy.get_param("~min_lane_sep_ratio", 0.20))
 
-        # lane width EMA (폭이 갑자기 커지면 center가 흔들리므로)
+        # lane width EMA
         self.lane_width_ema = None
         self.lane_width_alpha = float(rospy.get_param("~lane_width_alpha", 0.20))
         self.widen_factor = float(rospy.get_param("~widen_factor", 1.35))
         self.nominal_lane_width_ratio = float(rospy.get_param("~nominal_lane_width_ratio", 0.52))
 
         # fallback 중앙밴드(동적 제거 실패 시)
-        self.fallback_center_band_half_ratio = float(rospy.get_param("~fallback_center_band_half_ratio", 0.23))
+        self.fallback_center_band_half_ratio = float(
+            rospy.get_param("~fallback_center_band_half_ratio", 0.23)
+        )
 
         rospy.loginfo("[LKAS] image_topic=%s cmd_topic=%s enable_topic=%s use_fsm=%s",
                       self.image_topic, self.cmd_topic, self.enable_topic, str(self.use_fsm))
@@ -158,7 +165,7 @@ class LKAS(object):
         return cv2.warpPerspective(img, matrix, (self.img_x, self.img_y))
 
     # -----------------------------
-    # 동적 “차선 사이 제거” 마스크
+    # 동적 “차선 사이 제거”
     # -----------------------------
     def remove_between_lanes(self, binary_line, left_base, right_base, y0, y1):
         if left_base is None or right_base is None:
@@ -192,14 +199,13 @@ class LKAS(object):
             y0 = int(h * 0.45)
             y1 = h
 
-        # ROI에서 히스토그램으로 좌/우 차선 베이스 추정
         roi = binary_line[y0:y1, :]
         histogram = np.sum(roi, axis=0)
 
         left_end = int(w * self.hist_left_max_ratio)
         right_start = int(w * self.hist_right_min_ratio)
-        left_end = clamp(left_end, 1, w-1)
-        right_start = clamp(right_start, 0, w-2)
+        left_end = clamp(left_end, 1, w - 1)
+        right_start = clamp(right_start, 0, w - 2)
 
         left_base = None
         right_base = None
@@ -211,40 +217,37 @@ class LKAS(object):
                 left_base = lidx
 
         # 우측 피크
-        if right_start < w-10:
+        if right_start < w - 10:
             ridx = int(np.argmax(histogram[right_start:])) + right_start
             if histogram[ridx] > 0:
                 right_base = ridx
 
-        # 좌/우 간격이 너무 좁으면(중앙 숫자에 잡힌 경우) 무효 처리
+        # 좌우 간격이 너무 좁으면(중앙 잡음/숫자) 무효
         if left_base is not None and right_base is not None:
             if (right_base - left_base) < int(w * self.min_lane_sep_ratio):
                 left_base, right_base = None, None
 
-        # 한쪽만 잡히면 “평소 폭(EMA/nominal)”로 반대쪽 추정
+        # 한쪽만 잡히면 폭 추정으로 반대쪽 보정
+        width_est = self.lane_width_ema if self.lane_width_ema is not None else (w * self.nominal_lane_width_ratio)
         if left_base is not None and right_base is None:
-            width_est = self.lane_width_ema if self.lane_width_ema is not None else (w * self.nominal_lane_width_ratio)
             right_base = int(left_base + width_est)
         if right_base is not None and left_base is None:
-            width_est = self.lane_width_ema if self.lane_width_ema is not None else (w * self.nominal_lane_width_ratio)
             left_base = int(right_base - width_est)
 
-        # clamp
         if left_base is not None:
-            left_base = clamp(left_base, 0, w-1)
+            left_base = clamp(left_base, 0, w - 1)
         if right_base is not None:
-            right_base = clamp(right_base, 0, w-1)
+            right_base = clamp(right_base, 0, w - 1)
 
-        # 동적 제거 적용
         if left_base is not None and right_base is not None and right_base > left_base:
             binary_line = self.remove_between_lanes(binary_line, left_base, right_base, y0, y1)
         else:
-            # fallback: 중앙 밴드 제거(동적이 실패했을 때만)
+            # fallback: 중앙 밴드 제거(동적 실패시)
             cx = w // 2
             half = int(w * self.fallback_center_band_half_ratio)
-            x0 = clamp(cx - half, 0, w)
-            x1 = clamp(cx + half, 0, w)
-            binary_line[y0:y1, x0:x1] = 0
+            x0b = clamp(cx - half, 0, w)
+            x1b = clamp(cx + half, 0, w)
+            binary_line[y0:y1, x0b:x1b] = 0
 
         return binary_line
 
@@ -268,7 +271,7 @@ class LKAS(object):
     def window_search(self, binary_line):
         h, w = binary_line.shape
 
-        bottom_half = binary_line[h // 2 :, :]
+        bottom_half = binary_line[h // 2:, :]
         histogram = np.sum(bottom_half, axis=0)
 
         midpoint = w // 2
@@ -323,13 +326,14 @@ class LKAS(object):
         left_count = int(len(left_x))
         right_count = int(len(right_x))
 
-        # fallback 처리
+        # fallback
         if left_count == 0 and right_count == 0:
             left_x = self.nothing_pixel_left_x
             left_y = self.nothing_pixel_y
             right_x = self.nothing_pixel_right_x
             right_y = self.nothing_pixel_y
-            left_count = right_count = 0
+            left_count = 0
+            right_count = 0
         else:
             if left_count == 0:
                 left_x = right_x - self.img_x // 2
@@ -340,7 +344,7 @@ class LKAS(object):
                 right_y = left_y
                 right_count = 0
 
-        # draw (optional)
+        # draw
         try:
             left_fit = np.polyfit(left_y, left_x, 2)
             right_fit = np.polyfit(right_y, right_x, 2)
@@ -370,8 +374,8 @@ class LKAS(object):
         bottom_y = h - 1
         y2 = bottom_y * bottom_y
 
-        have_left = left_count >= 20 and len(left_y) >= 3
-        have_right = right_count >= 20 and len(right_y) >= 3
+        have_left = (left_count >= 20) and (len(left_y) >= 3)
+        have_right = (right_count >= 20) and (len(right_y) >= 3)
 
         bottom_x_left = None
         bottom_x_right = None
@@ -383,8 +387,9 @@ class LKAS(object):
             rf = np.polyfit(right_y, right_x, 2)
             bottom_x_right = rf[0] * y2 + rf[1] * bottom_y + rf[2]
 
-        # lane width 업데이트(둘 다 있을 때만)
+        # width 측정(둘 다 있을 때)
         width = None
+        prev_ema = self.lane_width_ema
         if bottom_x_left is not None and bottom_x_right is not None:
             width = float(bottom_x_right - bottom_x_left)
             if width > 10:
@@ -393,13 +398,14 @@ class LKAS(object):
                 else:
                     self.lane_width_ema = (1.0 - self.lane_width_alpha) * self.lane_width_ema + self.lane_width_alpha * width
 
-        # 평소 폭 추정값
         nominal = self.lane_width_ema
         if nominal is None:
             nominal = img.shape[1] * self.nominal_lane_width_ratio
 
-        # (핵심) 폭이 갑자기 커지면: center를 “한쪽 차선 + nominal/2”로 결정
-        if (width is not None) and (self.lane_width_ema is not None) and (width > self.widen_factor * self.lane_width_ema):
+        # (핵심) 폭이 “기존 폭(EMA)” 대비 갑자기 커진 경우: 한쪽 기준으로 center 결정
+        # 비교는 prev_ema(업데이트 전)를 우선 사용
+        ref = prev_ema if prev_ema is not None else self.lane_width_ema
+        if (width is not None) and (ref is not None) and (width > self.widen_factor * ref):
             if left_count >= right_count and bottom_x_left is not None:
                 return float(bottom_x_left + nominal / 2.0)
             if bottom_x_right is not None:
@@ -415,16 +421,15 @@ class LKAS(object):
         if bottom_x_right is not None:
             return float(bottom_x_right - nominal / 2.0)
 
-        # 둘 다 없으면 화면 중앙
         return float(img.shape[1] / 2.0)
 
     # -----------------------------
     # 제어
     # -----------------------------
     def ctrl_cmd(self, img_center_x, target_center_x):
-        # 정규화 오프셋: +면 차선 중심이 오른쪽(=차가 왼쪽으로 치우침)
         w = float(max(1, self.img_x))
         norm_err = (img_center_x - target_center_x) / w  # 대략 -0.5 ~ +0.5
+
         yaw = -norm_err * self.turn_mult
         yaw = clamp(yaw, -self.max_yaw, self.max_yaw)
 
@@ -445,12 +450,19 @@ class LKAS(object):
             return
 
         try:
-            # python2/3 호환 위해 desired_encoding 명시
-            img = self.bridge.compressed_imgmsg_to_cv2(data, desired_encoding="bgr8")
+            # cv_bridge 호환 처리 (환경에 따라 desired_encoding 인자 지원이 다를 수 있음)
+            try:
+                img = self.bridge.compressed_imgmsg_to_cv2(data, desired_encoding="bgr8")
+            except TypeError:
+                img = self.bridge.compressed_imgmsg_to_cv2(data)
+
+            if img is None:
+                return
 
             # downscale
             h, w = img.shape[:2]
-            img = cv2.resize(img, (w // 2, h // 2))
+            if h > 2 and w > 2:
+                img = cv2.resize(img, (w // 2, h // 2))
 
             # window params
             self.window_height = img.shape[0] // self.nwindows
@@ -465,7 +477,9 @@ class LKAS(object):
 
             sliding_window_img, left_x, left_y, right_x, right_y, left_cnt, right_cnt = self.window_search(binary_img)
 
-            target_center_x = self.compute_lane_center(sliding_window_img, left_x, left_y, right_x, right_y, left_cnt, right_cnt)
+            target_center_x = self.compute_lane_center(
+                sliding_window_img, left_x, left_y, right_x, right_y, left_cnt, right_cnt
+            )
             img_center_x = sliding_window_img.shape[1] / 2.0
 
             ctrl_cmd_msg = self.ctrl_cmd(img_center_x, target_center_x)
@@ -489,9 +503,15 @@ class LKAS(object):
                 self.have_published_cmd = True
                 self.last_pub_time = now
 
+                rospy.loginfo_throttle(
+                    self.debug_throttle,
+                    "[LKAS] pub cmd_vel_lkas v=%.3f yaw=%.3f (left_cnt=%d right_cnt=%d, enabled=%s)",
+                    ctrl_cmd_msg.linear.x, ctrl_cmd_msg.angular.z, left_cnt, right_cnt, str(self.enabled)
+                )
+
         except Exception as e:
             rospy.logerr("[LKAS] exception in img_CB: %s", str(e))
-            # 안전 정지 (단, publish 자체는 하여 have_lkas_cmd deadlock을 방지)
+            # 안전 정지 (단, publish 자체는 해서 fsm_mux have_lkas_cmd가 영원히 False가 되는 상황을 막음)
             stop = Twist()
             self.ctrl_pub.publish(stop)
             self.have_published_cmd = True
