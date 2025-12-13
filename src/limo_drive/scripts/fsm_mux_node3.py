@@ -14,10 +14,11 @@ class DriveMode(enum.Enum):
 
 
 class Mission3Phase(enum.Enum):
-    BEFORE = 0        # 아직 미션3 시퀀스 시작 전
-    TURNING = 1       # 고정 조향 구간
-    FORCE_OBS = 2     # 장애물 회피 강제 ON 구간 (mission3_node 사용)
-    DONE = 3          # 미션3 시퀀스 끝
+    BEFORE = 0         # 아직 미션3 시퀀스 시작 전
+    TURNING = 1        # 고정 조향 구간
+    FORCE_OBS = 2      # mission3 DWA 강제 ON 구간
+    FORCE_BASE = 3     # base obstacle 강제 ON 구간
+    DONE = 4           # 미션3 시퀀스 끝
 
 
 class V2XPhase(enum.Enum):
@@ -69,13 +70,17 @@ class FSMMuxNode:
         self.loop_rate = rospy.get_param("~loop_rate", 30.0)
 
         # ----- Mission3 / V2X 타이밍 파라미터 -----
-        self.m3_phase_time       = rospy.get_param("~m3_phase_time", 35.3)   # 첫 LKAS cmd 이후 기준
-        self.m3_turn_duration    = rospy.get_param("~m3_turn_duration", 2.5)
-        self.m3_turn_speed       = rospy.get_param("~m3_turn_speed", 0.16)
-        self.m3_turn_yaw         = rospy.get_param("~m3_turn_yaw", -0.4)
+        self.m3_phase_time          = rospy.get_param("~m3_phase_time", 35.3)   # 첫 LKAS cmd 이후 기준
+        self.m3_turn_duration       = rospy.get_param("~m3_turn_duration", 2.5)
+        self.m3_turn_speed          = rospy.get_param("~m3_turn_speed", 0.16)
+        self.m3_turn_yaw            = rospy.get_param("~m3_turn_yaw", -0.4)
 
-        self.m3_force_obs_duration = rospy.get_param("~m3_force_obs_duration", 5.0)
+        # mission3 DWA 강제 구간
+        self.m3_force_obs_duration  = rospy.get_param("~m3_force_obs_duration", 5.0)
+        # ★ mission3 끝난 직후 base obstacle 강제 구간
+        self.m3_force_base_duration = rospy.get_param("~m3_force_base_duration", 4.0)
 
+        # v2x
         self.v2x_phase_time      = rospy.get_param("~v2x_phase_time", 22.0)
         self.v2x_turn_duration   = rospy.get_param("~v2x_turn_duration", 0.5)
         self.v2x_turn_speed      = rospy.get_param("~v2x_turn_speed", 0.0)
@@ -103,6 +108,7 @@ class FSMMuxNode:
         self.m3_phase = Mission3Phase.BEFORE
         self.m3_turn_start_time = None
         self.m3_force_obs_start_time = None
+        self.m3_force_base_start_time = None   # ★ base 강제 구간 시작 시각
 
         self.v2x_phase = V2XPhase.WAIT_START
         self.v2x_start_time = None
@@ -238,10 +244,18 @@ class FSMMuxNode:
             if now - self.m3_turn_start_time >= self.m3_turn_duration:
                 self.m3_phase = Mission3Phase.FORCE_OBS
                 self.m3_force_obs_start_time = now
-                rospy.loginfo("[FSM_MUX] Mission3 FORCE_OBS start")
+                rospy.loginfo("[FSM_MUX] Mission3 FORCE_OBS (mission3_node) start")
 
         elif self.m3_phase == Mission3Phase.FORCE_OBS:
+            # mission3_node 강제 구간 끝 → base_obstacle 강제 구간으로 전이
             if now - self.m3_force_obs_start_time >= self.m3_force_obs_duration:
+                self.m3_phase = Mission3Phase.FORCE_BASE
+                self.m3_force_base_start_time = now
+                rospy.loginfo("[FSM_MUX] Mission3 FORCE_BASE (base_obstacle) start")
+
+        elif self.m3_phase == Mission3Phase.FORCE_BASE:
+            # base_obstacle 강제 구간 끝 → DONE
+            if now - self.m3_force_base_start_time >= self.m3_force_base_duration:
                 self.m3_phase = Mission3Phase.DONE
                 rospy.loginfo("[FSM_MUX] Mission3 sequence DONE")
 
@@ -250,14 +264,20 @@ class FSMMuxNode:
     def update_mode_basic(self):
         """
         - 미션3 FORCE_OBS 시: 무조건 OBSTACLE_AVOID (mission3_node 사용)
+        - 미션3 FORCE_BASE 시: 무조건 OBSTACLE_AVOID (base_obstacle 사용)
         - 그 외: obstacle_state True → OBSTACLE_AVOID, False → LANE_FOLLOW
         """
-        if self.m3_phase == Mission3Phase.FORCE_OBS:
+        # ★ 미션3 강제 구간 (DWA + base 둘 다)에서는 장애물 상태와 관계 없이
+        #    항상 OBSTACLE_AVOID 모드 유지
+        if self.m3_phase in (Mission3Phase.FORCE_OBS, Mission3Phase.FORCE_BASE):
             if self.current_mode != DriveMode.OBSTACLE_AVOID:
-                rospy.loginfo("[FSM_MUX] -> OBSTACLE_AVOID (Mission3 FORCE_OBS)")
+                reason = "FORCE_OBS(mission3)" if self.m3_phase == Mission3Phase.FORCE_OBS \
+                         else "FORCE_BASE(base_obstacle)"
+                rospy.loginfo("[FSM_MUX] -> OBSTACLE_AVOID (%s)", reason)
             self.current_mode = DriveMode.OBSTACLE_AVOID
             return
 
+        # 평상시: obstacle_state 기반
         if self.obstacle_state and self.current_mode != DriveMode.OBSTACLE_AVOID:
             rospy.loginfo("[FSM_MUX] -> OBSTACLE_AVOID (obstacle_state=True)")
             self.current_mode = DriveMode.OBSTACLE_AVOID
@@ -312,14 +332,15 @@ class FSMMuxNode:
         lkas_en.data = (self.current_mode == DriveMode.LANE_FOLLOW)
         self.lkas_enable_pub.publish(lkas_en)
 
-        # mission3_enable : 미션3 FORCE_OBS 구간에만 True
+        # mission3_enable : 미션3 FORCE_OBS 구간에만 True (DWA만 켬)
         m3_en = Bool()
         m3_en.data = (self.m3_phase == Mission3Phase.FORCE_OBS)
         self.mission3_enable_pub.publish(m3_en)
 
         # base obstacle_enable :
         #  - DriveMode 가 OBSTACLE_AVOID 이고
-        #  - 미션3 FORCE_OBS 가 아닐 때만 True
+        #  - 미션3 FORCE_OBS(=DWA) 가 아닐 때 True
+        #    → FORCE_BASE 구간 + 일반 obstacle 구간 모두 포함
         obs_en = Bool()
         obs_en.data = (
             self.current_mode == DriveMode.OBSTACLE_AVOID
@@ -334,6 +355,7 @@ class FSMMuxNode:
         현재 DriveMode에 따라 lkas / obstacle cmd 중 하나 선택해서 /cmd_vel로 publish
         + Mission3 TURN / v2x TURN 구간에서는 고정 조향으로 override
         + Mission3 FORCE_OBS 구간에서는 mission3_node cmd 우선 사용
+        + Mission3 FORCE_BASE 구간에서는 base_obstacle cmd 강제 사용
         """
         cmd = Twist()
 
@@ -357,7 +379,7 @@ class FSMMuxNode:
                     cmd.linear.x = 0.0
                     cmd.angular.z = 0.0
             else:
-                # 평소 OBSTACLE_AVOID 는 base obstacle 사용
+                # FORCE_BASE + 일반 OBSTACLE_AVOID 둘 다 base obstacle 사용
                 if self.have_obstacle_cmd:
                     cmd = copy.deepcopy(self.last_obstacle_cmd)
                 else:
